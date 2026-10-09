@@ -1,0 +1,328 @@
+# REVIEW DRAFT ONLY. Do not publish unless repository Actions are disabled.
+# Enabling Actions or dispatching this workflow requires separate approval.
+name: Authenticate Ubuntu 24.04.5 Server AMD64 checksum
+
+"on":
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ubuntu-iso-authenticity-check
+  cancel-in-progress: false
+
+jobs:
+  authenticate-checksum:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Preflight and authenticate public verification documents only
+        shell: /usr/bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          # Python isolated mode ignores user site-packages and PYTHONPATH.
+          # No checkout, executable downloads, installation, or ISO access.
+          /usr/bin/python3 -I - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import platform
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import time
+
+          RELEASE = "24.04.5"
+          ISO = "ubuntu-24.04.5-live-server-amd64.iso"
+          PRIMARY = "843938DF228D22F7B3742BC0D94AA3F0EFE21092"
+          FINGERPRINT_SOURCE = "https://documentation.ubuntu.com/security/software-integrity/image-verification/"
+          DOCUMENTS = (
+              ("ubuntu-archive-keyring.gpg", "https://archive.ubuntu.com/ubuntu/project/ubuntu-archive-keyring.gpg", 1048576),
+              ("SHA256SUMS", "https://releases.ubuntu.com/24.04.5/SHA256SUMS", 262144),
+              ("SHA256SUMS.gpg", "https://releases.ubuntu.com/24.04.5/SHA256SUMS.gpg", 262144),
+          )
+          SYSTEM_KEYRING = pathlib.Path("/usr/share/keyrings/ubuntu-archive-keyring.gpg")
+          TOOLS = {
+              "/usr/bin/gpg": "gpg",
+              "/usr/bin/gpgv": "gpgv",
+              "/usr/bin/curl": "curl",
+              "/usr/bin/python3": "python3-minimal",
+              "/usr/bin/sha256sum": "coreutils",
+              "/usr/bin/dpkg-query": "dpkg",
+          }
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+          def run(arguments, timeout=30):
+              completed = subprocess.run(
+                  arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE, timeout=timeout, check=False,
+                  env=dict(os.environ, LC_ALL="C"),
+              )
+              require(completed.returncode == 0,
+                      pathlib.Path(arguments[0]).name + " failed; no fallback permitted")
+              return completed.stdout
+
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          try:
+              require(os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch",
+                      "Only manual dispatch is permitted")
+              require(os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted",
+                      "A standard GitHub-hosted runner is required")
+              require(platform.machine() == "x86_64", "AMD64 is required")
+              os_release = {}
+              for line in pathlib.Path("/etc/os-release").read_text().splitlines():
+                  if "=" in line:
+                      key, value = line.split("=", 1)
+                      os_release[key] = value.strip('"')
+              require(os_release.get("ID") == "ubuntu"
+                      and os_release.get("VERSION_ID") == "24.04", "Ubuntu 24.04 is required")
+              require(os.environ.get("ImageOS") == "ubuntu24", "Unexpected image family")
+              image_version = os.environ.get("ImageVersion", "")
+              require(re.fullmatch(r"[0-9]{8}\.[0-9]+\.[0-9]+", image_version),
+                      "Missing or malformed runner image version")
+              repository = os.environ.get("GITHUB_REPOSITORY", "")
+              require(re.fullmatch(r"[A-Za-z0-9-]+/ubuntu-iso-authenticity-check", repository),
+                      "Unexpected verification repository")
+              commit = os.environ.get("GITHUB_SHA", "")
+              require(re.fullmatch(r"[0-9a-f]{40}", commit), "Missing workflow commit")
+              run_id = os.environ.get("GITHUB_RUN_ID", "")
+              attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+              require(run_id.isdigit() and attempt.isdigit(), "Missing run identity")
+              actor = os.environ.get("GITHUB_ACTOR", "")
+              require(re.fullmatch(r"[A-Za-z0-9_-]+(?:\[bot\])?", actor), "Unexpected actor")
+
+              require(os.environ.get("RUNNER_TEMP"), "Runner temporary directory is missing")
+              runner_temp = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+              require(runner_temp.is_dir(), "Runner temporary directory is invalid")
+              os.umask(0o077)
+              work = pathlib.Path(tempfile.mkdtemp(prefix="ubuntu-auth-", dir=runner_temp))
+              home = work / "gnupg"
+              home.mkdir(mode=0o700)
+              tool_evidence = {}
+              for executable, package in TOOLS.items():
+                  path = pathlib.Path(executable)
+                  require(path.is_file() and os.access(path, os.X_OK),
+                          "Missing required preinstalled tool: " + executable)
+                  owner = run(["/usr/bin/dpkg-query", "-S", executable]).decode("utf-8").strip()
+                  require(owner.split(":", 1)[0] == package,
+                          "Unexpected tool package owner: " + executable)
+                  version_arguments = [executable, "--version"]
+                  if executable == "/usr/bin/gpg":
+                      version_arguments = [executable, "--no-options", "--homedir",
+                                           str(home), "--version"]
+                  elif executable == "/usr/bin/gpgv":
+                      version_arguments = [executable, "--homedir", str(home), "--version"]
+                  version = run(version_arguments).decode("utf-8").splitlines()[0]
+                  package_version = run(["/usr/bin/dpkg-query", "-W", package]).decode("utf-8").strip()
+                  tool_evidence[executable] = {
+                      "resolved_path": str(path.resolve(strict=True)), "version": version,
+                      "package": package_version, "binary_sha256": digest(path),
+                  }
+              require(SYSTEM_KEYRING.is_file() and os.access(SYSTEM_KEYRING, os.R_OK),
+                      "Preinstalled Ubuntu keyring is missing")
+              keyring_owner = run(["/usr/bin/dpkg-query", "-S", str(SYSTEM_KEYRING)]).decode("utf-8").strip()
+              require(keyring_owner.split(":", 1)[0] == "ubuntu-keyring",
+                      "Unexpected preinstalled keyring owner")
+              keyring_package = run(["/usr/bin/dpkg-query", "-W", "ubuntu-keyring"]).decode("utf-8").strip()
+              system_digest = digest(SYSTEM_KEYRING)
+
+              installed_copy = work / "installed-ubuntu-keyring.gpg"
+              installed_copy.write_bytes(SYSTEM_KEYRING.read_bytes())
+              require(digest(installed_copy) == system_digest, "Installed keyring changed during copy")
+
+              gpg = [
+                  "/usr/bin/gpg", "--no-options", "--batch", "--no-tty",
+                  "--homedir", str(home), "--no-default-keyring",
+                  "--no-auto-check-trustdb", "--no-auto-key-retrieve",
+                  "--auto-key-locate", "clear", "--no-autostart",
+              ]
+              now = int(time.time())
+
+              def key_records(path):
+                  raw = run(gpg + ["--with-colons", "--with-fingerprint",
+                                   "--with-subkey-fingerprint", "--show-keys", str(path)])
+                  families, family, pending = [], None, None
+                  for line in raw.decode("utf-8").splitlines():
+                      fields = line.split(":")
+                      kind = fields[0]
+                      require(kind not in {"sec", "ssb"}, "Secret key material is forbidden")
+                      if kind in {"pub", "sub"}:
+                          require(pending is None, "Missing key fingerprint")
+                          require(len(fields) >= 12, "Malformed key metadata")
+                          if kind == "pub":
+                              family = {"primary": None, "keys": {}}
+                              families.append(family)
+                          require(family is not None, "Unbound subkey")
+                          pending = (kind, fields)
+                      elif kind == "fpr":
+                          require(pending is not None and len(fields) >= 10,
+                                  "Ambiguous key fingerprint")
+                          fingerprint = fields[9]
+                          require(re.fullmatch(r"[0-9A-F]{40}", fingerprint),
+                                  "Malformed key fingerprint")
+                          require(fingerprint not in family["keys"], "Duplicate key fingerprint")
+                          kind, metadata = pending
+                          family["keys"][fingerprint] = metadata
+                          if kind == "pub":
+                              family["primary"] = fingerprint
+                          pending = None
+                  require(pending is None and families, "Incomplete key material")
+                  return families
+
+              def check_key(metadata):
+                  require(metadata[1] in {"", "-", "o", "q", "m", "f", "u"},
+                          "Invalid, disabled, expired, revoked, or unsupported key status")
+                  require("D" not in metadata[11], "Disabled key")
+                  require(metadata[5].isdigit() and int(metadata[5]) <= now,
+                          "Invalid or future key creation time")
+                  require(not metadata[6] or
+                          (metadata[6].isdigit() and
+                           (int(metadata[6]) == 0 or int(metadata[6]) > now)), "Expired key")
+
+              def pinned_family(path):
+                  matches = [item for item in key_records(path) if item["primary"] == PRIMARY]
+                  require(len(matches) == 1, "Pinned image-signing key missing or ambiguous")
+                  selected = matches[0]
+                  metadata = selected["keys"][PRIMARY]
+                  check_key(metadata)
+                  require(metadata[2] == "4096" and metadata[3] == "1"
+                          and metadata[4] == PRIMARY[-16:], "Unexpected pinned primary-key properties")
+                  return selected
+
+              # Missing installed material cannot be hidden by downloading it.
+              pinned_family(installed_copy)
+              print("PREINSTALLED_PREREQUISITES_ACCEPTED; signature verification still pending")
+
+              for filename, url, maximum in DOCUMENTS:
+                  destination = work / filename
+                  http_status = run([
+                      "/usr/bin/curl", "--disable", "--fail", "--silent", "--show-error",
+                      "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2",
+                      "--max-redirs", "0", "--connect-timeout", "10", "--max-time", "40",
+                      "--max-filesize", str(maximum), "--output", str(destination),
+                      "--write-out", "%{http_code}", url,
+                  ], timeout=45).decode("ascii")
+                  require(http_status == "200", "Unexpected HTTP status or redirect")
+                  require(destination.is_file() and 0 < destination.stat().st_size <= maximum,
+                          "Missing, empty, or oversized public verification document")
+              public_keyring = work / "ubuntu-archive-keyring.gpg"
+              pinned_family(public_keyring)
+              verifier_keyring = work / "pinned-image-signing-key.gpg"
+              verifier_keyring.write_bytes(run(
+                  gpg + ["--keyring", str(public_keyring), "--export", PRIMARY]))
+              exported = key_records(verifier_keyring)
+              require(len(exported) == 1 and exported[0]["primary"] == PRIMARY,
+                      "Verifier keyring must contain only the pinned primary key")
+              family = pinned_family(verifier_keyring)
+
+              sums, signature = work / "SHA256SUMS", work / "SHA256SUMS.gpg"
+              gpgv_home = work / "gpgv"
+              gpgv_home.mkdir(mode=0o700)
+              statuses = {
+                  "gpgv": run(["/usr/bin/gpgv", "--homedir", str(gpgv_home),
+                               "--keyring", str(verifier_keyring), "--status-fd", "1",
+                               str(signature), str(sums)]),
+                  "gpg": run(gpg + ["--keyring", str(verifier_keyring), "--status-fd", "1",
+                                    "--verify", str(signature), str(sums)]),
+              }
+
+              def validate_status(raw):
+                  allowed = {
+                      "NEWSIG", "KEY_CONSIDERED", "SIG_ID", "GOODSIG", "VALIDSIG",
+                      "TRUST_UNDEFINED", "TRUST_MARGINAL", "TRUST_FULLY", "TRUST_ULTIMATE",
+                      "VERIFICATION_COMPLIANCE_MODE",
+                  }
+                  entries = []
+                  for line in raw.decode("utf-8").splitlines():
+                      require(line.startswith("[GNUPG:] "), "Malformed verifier status")
+                      parts = line[len("[GNUPG:] "):].split()
+                      require(parts and parts[0] in allowed,
+                              "Failure or unsupported verifier status; no fallback permitted")
+                      entries.append(parts)
+                  valid = [parts for parts in entries if parts[0] == "VALIDSIG"]
+                  good = [parts for parts in entries if parts[0] == "GOODSIG"]
+                  require(len(valid) == 1 and len(good) == 1, "Ambiguous or missing valid signature")
+                  parts = valid[0]
+                  require(len(parts) in {10, 11}, "Malformed VALIDSIG")
+                  signer = parts[1]
+                  primary = parts[10] if len(parts) == 11 else signer
+                  require(primary == PRIMARY and signer in family["keys"], "Unexpected signer")
+                  require(len(good[0]) >= 2 and good[0][1] in {signer, signer[-16:]},
+                          "Inconsistent signature identity")
+                  check_key(family["keys"][signer])
+                  require(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", parts[2]),
+                          "Malformed signature date")
+                  require(parts[3].isdigit() and 0 < int(parts[3]) <= now,
+                          "Invalid or future signature timestamp")
+                  require(parts[4].isdigit() and
+                          (int(parts[4]) == 0 or int(parts[4]) > now), "Expired signature")
+                  require(parts[5] == "4" and parts[7] == "1"
+                          and parts[8] in {"8", "9", "10"} and parts[9] in {"00", "01"},
+                          "Unsupported signature version, algorithm, or class")
+                  return {
+                      "primary_fingerprint": primary, "signing_fingerprint": signer,
+                      "signature_timestamp": int(parts[3]), "hash_algorithm_id": parts[8],
+                  }
+
+              verified = {name: validate_status(raw) for name, raw in statuses.items()}
+              require(verified["gpgv"] == verified["gpg"], "Verifier results disagree")
+              entries = {}
+              text = sums.read_bytes().decode("ascii")
+              require(text.endswith("\n"), "Truncated checksum document")
+              for line in text.splitlines():
+                  match = re.fullmatch(r"([0-9a-fA-F]{64}) ([ *])([A-Za-z0-9][A-Za-z0-9._-]{0,199})", line)
+                  require(match is not None, "Malformed checksum entry")
+                  checksum, marker, filename = match.groups()
+                  require(filename not in entries, "Duplicate checksum filename")
+                  entries[filename] = checksum.lower()
+              require(ISO in entries, "Exact pinned ISO checksum is missing")
+              require(digest(SYSTEM_KEYRING) == system_digest, "System keyring changed during execution")
+
+              evidence = {
+                  "result": "PUBLIC_MANIFEST_AUTHENTICATED",
+                  "local_iso_status": "NOT_CHECKED_NO_ISO_ACCESSED",
+                  "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  "repository": repository, "workflow_commit": commit,
+                  "run_url": "https://github.com/" + repository + "/actions/runs/" + run_id,
+                  "run_attempt": attempt, "actor": actor,
+                  "runner_image": image_version, "image_os": "ubuntu24",
+                  "os_version": os_release.get("PRETTY_NAME"), "architecture": "x86_64",
+                  "tools": tool_evidence, "installed_keyring_package": keyring_package,
+                  "installed_keyring_sha256": system_digest,
+                  "fingerprint_source": FINGERPRINT_SOURCE, "release": RELEASE,
+                  "verifiers": verified, "gpgv_exit_code": 0, "gpg_exit_code": 0,
+                  "verifier_keyring_sha256": digest(verifier_keyring),
+                  "documents": [
+                      {"url": url, "bytes": (work / filename).stat().st_size,
+                       "sha256": digest(work / filename)}
+                      for filename, url, maximum in DOCUMENTS
+                  ],
+                  "iso_filename": ISO, "authenticated_iso_sha256": entries[ISO],
+              }
+              # JSON escapes strings; no raw UID, network body, or diagnostics are logged.
+              report = json.dumps(evidence, indent=2, ensure_ascii=True)
+              summary = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).resolve()
+              require(summary.is_relative_to(runner_temp),
+                      "Unexpected job-summary destination")
+              summary.write_text(
+                  "# Public Ubuntu checksum authenticated\n\n"
+                  "The local ISO has NOT been checked. No ISO was accessed.\n\n"
+                  "~~~json\n" + report + "\n~~~\n", encoding="utf-8")
+              print(report)
+          except Exception as error:
+              print("VERIFICATION_FAILED_OR_INCOMPLETE: " + type(error).__name__, file=sys.stderr)
+              if isinstance(error, RuntimeError):
+                  # These messages are fixed gate labels, not downloaded diagnostics.
+                  print(str(error), file=sys.stderr)
+              print("Stop and review the failed gate; do not install, change trust, or retry automatically.",
+                    file=sys.stderr)
+              sys.exit(1)
+          PY
